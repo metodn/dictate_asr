@@ -1,0 +1,10 @@
+# written by the Claude Code engine, regenerated on load
+.claude-plugin/types/
+.mcpb-cache/
+# local scratch and noise
+_tmp_test/
+node_modules/
+*.log
+.DS_Store
+*~
+*.swp

@@ -1,0 +1,182 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx>=0.27"]
+# ///
+"""Streaming dictation straight against llama-swap (no adapter server).
+
+  claude-dictate-ws record   mic -> repeated decodes of the growing audio, prints JSON lines:
+                             {"t":"p","text":..} interim, {"t":"f","text":..} final, {"t":"e","text":..} error
+  claude-dictate-ws stop     finish the running recording (SIGTERM)
+
+Env: SWAP (http://localhost:8181), ASR_MODEL (lfm3-audio-2b), ASR_LANG (unset = auto),
+     STEP_SEC (1.0), SEG_SEC (40, longer audio is committed in segments), MAX_SECS (120)
+"""
+import asyncio, base64, json, os, re, signal, struct, sys
+from pathlib import Path
+
+SWAP = os.environ.get("SWAP", "http://localhost:8181")
+MODEL = os.environ.get("ASR_MODEL", "lfm3-audio-2b")
+LANG = os.environ.get("ASR_LANG", "")
+STEP = float(os.environ.get("STEP_SEC", "1.0"))
+SEG = float(os.environ.get("SEG_SEC", "40"))
+MAX = float(os.environ.get("MAX_SECS", "120"))
+RATE, BPS = 16000, 32000  # sample rate, bytes per second
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "claude-dictate"
+PIDF = RUN / "pid"
+
+
+def emit(t: str, text: str = "") -> None:
+    print(json.dumps({"t": t, "text": text}, ensure_ascii=False), flush=True)
+
+
+def clean(t: str) -> str:
+    return re.sub(r"<_*media_*>", "", t).strip()
+
+
+def trim_silence(pcm: bytes) -> bytes:
+    """Drop leading silence (the model invents phrases from room noise); b'' if all quiet."""
+    from array import array
+    win = 3200  # 100 ms of s16le bytes
+    for i in range(0, len(pcm) - win + 1, win):
+        a = array("h", pcm[i:i + win])
+        if (sum(x * x for x in a) / len(a)) ** 0.5 > 260:   # ~0.008 of full scale
+            return pcm[max(0, i - 3 * win):]
+    return b""
+
+
+def wav(pcm: bytes) -> bytes:
+    n = len(pcm)
+    return b"".join([b"RIFF", struct.pack("<I", 36 + n), b"WAVE", b"fmt ",
+                     struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16),
+                     b"data", struct.pack("<I", n), pcm])
+
+
+async def decode(client, pcm: bytes) -> str:
+    system = f"Perform ASR in {LANG}." if LANG else "Perform ASR."
+    r = await client.post(f"{SWAP}/v1/chat/completions", timeout=120.0, json={
+        "model": MODEL, "temperature": 0, "max_tokens": 1024,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                "data": base64.b64encode(wav(pcm)).decode(), "format": "wav"}}]},
+        ]})
+    r.raise_for_status()
+    return clean(r.json()["choices"][0]["message"]["content"] or "")
+
+
+async def record() -> int:
+    import httpx
+
+    RUN.mkdir(parents=True, exist_ok=True)
+    if PIDF.exists():
+        try:
+            os.kill(int(PIDF.read_text()), 0)
+            emit("e", "already recording")
+            return 1
+        except (ProcessLookupError, ValueError):
+            pass
+    PIDF.write_text(str(os.getpid()))
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+
+    buf = bytearray()
+    committed: list[str] = []   # finished segments
+    seg_start = 0               # byte offset where the current segment begins
+    seg_text = ""               # latest decode of the current segment
+    decoded_len = 0             # len(buf) at the last decode
+    last_shown = ""
+
+    rec = await asyncio.create_subprocess_exec(
+        "parecord", "--raw", "--latency-msec=30", "--channels=1", "--rate=16000", "--format=s16le",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+
+    async def pump() -> None:
+        while chunk := await rec.stdout.read(3200):
+            buf.extend(chunk)
+
+    def full() -> str:
+        return " ".join(t for t in committed + [seg_text] if t)
+
+    async def decode_now(client, final: bool) -> None:
+        nonlocal seg_text, seg_start, decoded_len, last_shown
+        n = len(buf)
+        voiced = trim_silence(bytes(buf[seg_start:n]))
+        text = await decode(client, voiced) if len(voiced) >= 0.3 * BPS else ""
+        seg_text, decoded_len = text, n
+        if n - seg_start > SEG * BPS:   # long speech: commit this segment, start a new one
+            committed.append(seg_text)
+            seg_text, seg_start = "", n
+        shown = full()
+        if not final and shown and shown != last_shown:
+            last_shown = shown
+            emit("p", shown)
+
+    ptask = asyncio.create_task(pump())
+    try:
+        async with httpx.AsyncClient() as client:
+            started = loop.time()
+            while not stop.is_set() and loop.time() - started < MAX:
+                await asyncio.sleep(0.2)
+                new = len(buf) - decoded_len
+                if new >= STEP * BPS and len(buf) - seg_start >= 0.4 * BPS:
+                    await decode_now(client, False)  # one at a time: awaited here
+            if rec.returncode is None:
+                rec.terminate()
+            await ptask
+            if len(buf) - decoded_len > 0.15 * BPS and len(buf) - seg_start >= 0.4 * BPS:
+                await decode_now(client, True)       # audio after the last decode
+            emit("f", full())
+        return 0
+    except Exception as exc:  # llama-swap down, HTTP error, ...
+        emit("e", f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        if rec.returncode is None:
+            rec.terminate()
+        PIDF.unlink(missing_ok=True)
+
+
+def info_cmd() -> int:
+    """Where the voice goes, and whether that server is up. Starts nothing."""
+    import urllib.request
+    from urllib.parse import urlparse
+
+    host = urlparse(SWAP).hostname or "?"
+    is_local = host in ("localhost", "127.0.0.1", "::1")
+
+    def get(path: str):
+        with urllib.request.urlopen(f"{SWAP}{path}", timeout=3) as r:
+            return r.read().decode()
+
+    try:
+        get("/health")
+        reach = "reachable"
+        running = json.loads(get("/running")).get("running", [])
+        loaded = next((m["state"] for m in running if m.get("model") == MODEL), None)
+        model_line = f"{MODEL} ({'loaded, ' + loaded if loaded else 'not loaded now, loads on first use'})"
+    except Exception as exc:
+        reach = f"NOT reachable ({type(exc).__name__})"
+        model_line = MODEL
+    print(f"voice server: {SWAP}  [{'this machine' if is_local else 'REMOTE host ' + host}]  {reach}")
+    print(f"model:        {model_line}")
+    print(f"language:     {LANG or 'auto-detect'}")
+    print(f"audio:        recorded locally with parecord, sent only to {host}")
+    print(f"recording:    {'yes' if PIDF.exists() else 'no'}")
+    return 0
+
+
+def stop_cmd() -> int:
+    try:
+        os.kill(int(PIDF.read_text()), signal.SIGTERM)
+        return 0
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        print("not recording", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    sys.exit(asyncio.run(record()) if cmd == "record" else stop_cmd() if cmd == "stop" else info_cmd() if cmd == "info" else 2)
