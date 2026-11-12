@@ -6,21 +6,60 @@
 """Streaming dictation straight against llama-swap (no adapter server).
 
   claude-dictate-ws record   mic -> repeated decodes of the growing audio, prints JSON lines:
-                             {"t":"p","text":..} interim, {"t":"f","text":..} final, {"t":"e","text":..} error
+                             {"t":"p","text":..} interim, {"t":"f","text":..} final, {"t":"e","text":..} error,
+                             {"t":"s","text":..} server status (fallback in use)
   claude-dictate-ws stop     finish the running recording (SIGTERM)
+  claude-dictate-ws info | help | use <name> | add <name> <host[:port]|url> [model] [key=<token>] | remove <name> | warm
 
-Env: SWAP (http://localhost:8181), ASR_MODEL (lfm3-audio-2b), ASR_LANG (unset = auto),
+Servers live in ~/.config/claude-dictate/servers.json (mode 600, may hold API keys):
+  {"active": "local", "servers": [{"name": "local", "url": "http://localhost:8181", "model": "lfm3-audio-2b", "apiKey": "..."}]}
+The active server is tried first; if it fails the others are tried in order.
+Env: SWAP / ASR_MODEL / ASR_API_KEY (one server "env" that replaces the file), ASR_LANG (unset = auto),
      STEP_SEC (1.0), SEG_SEC (40, longer audio is committed in segments), MAX_SECS (120)
 """
 import asyncio, base64, json, os, re, signal, struct, sys
 from pathlib import Path
 
-SWAP = os.environ.get("SWAP", "http://localhost:8181")
-MODEL = os.environ.get("ASR_MODEL", "lfm3-audio-2b")
 LANG = os.environ.get("ASR_LANG", "")
 STEP = float(os.environ.get("STEP_SEC", "1.0"))
 SEG = float(os.environ.get("SEG_SEC", "40"))
 MAX = float(os.environ.get("MAX_SECS", "120"))
+CFG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "claude-dictate" / "servers.json"
+DEFAULT_MODEL = "lfm3-audio-2b"
+
+
+def load_cfg() -> dict:
+    if os.environ.get("SWAP"):
+        srv = {"name": "env", "url": os.environ["SWAP"].rstrip("/"), "model": os.environ.get("ASR_MODEL", DEFAULT_MODEL)}
+        if os.environ.get("ASR_API_KEY"):
+            srv["apiKey"] = os.environ["ASR_API_KEY"]
+        return {"active": "env", "servers": [srv]}
+    try:
+        c = json.loads(CFG.read_text())
+        if c.get("servers"):
+            if c.get("active") not in [x["name"] for x in c["servers"]]:
+                c["active"] = c["servers"][0]["name"]
+            return c
+    except Exception:
+        pass
+    return {"active": "local", "servers": [{"name": "local", "url": "http://localhost:8181", "model": os.environ.get("ASR_MODEL", DEFAULT_MODEL)}]}
+
+
+def save_cfg(c: dict) -> None:
+    CFG.parent.mkdir(parents=True, exist_ok=True)
+    CFG.write_text(json.dumps(c, indent=2) + "\n")
+    CFG.chmod(0o600)
+
+
+def ordered(c: dict) -> list[dict]:
+    """Active server first, the rest as fallbacks."""
+    return sorted(c["servers"], key=lambda x: x["name"] != c["active"])
+
+
+def auth(srv: dict) -> dict:
+    return {"Authorization": f"Bearer {srv['apiKey']}"} if srv.get("apiKey") else {}
+
+
 RATE, BPS = 16000, 32000  # sample rate, bytes per second
 RUN = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "claude-dictate"
 PIDF = RUN / "pid"
@@ -52,10 +91,10 @@ def wav(pcm: bytes) -> bytes:
                      b"data", struct.pack("<I", n), pcm])
 
 
-async def decode(client, pcm: bytes) -> str:
+async def decode_one(client, srv: dict, pcm: bytes) -> str:
     system = f"Perform ASR in {LANG}." if LANG else "Perform ASR."
-    r = await client.post(f"{SWAP}/v1/chat/completions", timeout=120.0, json={
-        "model": MODEL, "temperature": 0, "max_tokens": 1024,
+    r = await client.post(f"{srv['url']}/v1/chat/completions", timeout=120.0, headers=auth(srv), json={
+        "model": srv["model"], "temperature": 0, "max_tokens": 1024,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": [{"type": "input_audio", "input_audio": {
@@ -63,6 +102,29 @@ async def decode(client, pcm: bytes) -> str:
         ]})
     r.raise_for_status()
     return clean(r.json()["choices"][0]["message"]["content"] or "")
+
+
+_used = ""
+
+
+async def decode(client, pcm: bytes) -> str:
+    """Try the active server, then the fallbacks; raise only when every one failed."""
+    global _used
+    cfg = load_cfg()
+    errs = []
+    for srv in ordered(cfg):
+        try:
+            text = await decode_one(client, srv, pcm)
+        except Exception as exc:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            why = "API key rejected" if code in (401, 403) else f"HTTP {code}" if code else type(exc).__name__
+            errs.append(f"{srv['name']} ({srv['url']}): {why}")
+            continue
+        if srv["name"] != _used:
+            _used = srv["name"]
+            emit("s", f"asr: {srv['name']}" + (f" (fallback, {cfg['active']} failed)" if srv["name"] != cfg["active"] else ""))
+        return text
+    raise RuntimeError("all servers failed: " + "; ".join(errs))
 
 
 async def record() -> int:
@@ -131,7 +193,7 @@ async def record() -> int:
             emit("f", full())
         return 0
     except Exception as exc:  # llama-swap down, HTTP error, ...
-        emit("e", f"{type(exc).__name__}: {exc}")
+        emit("e", str(exc) if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}")
         return 1
     finally:
         if rec.returncode is None:
@@ -139,32 +201,99 @@ async def record() -> int:
         PIDF.unlink(missing_ok=True)
 
 
+def probe(srv: dict) -> str:
+    import urllib.request, urllib.error
+    try:
+        req = urllib.request.Request(f"{srv['url']}/v1/models", headers=auth(srv))
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            ids = [m.get("id") for m in json.loads(r.read().decode()).get("data", [])]
+        return "ready" if srv["model"] in ids else "model not listed"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return "API key rejected" if srv.get("apiKey") else "needs an API key"
+        return "no models API yet"
+    except Exception:
+        return "down"
+
+
+def report() -> str:
+    cfg = load_cfg()
+    rows = [(f"{'*' if x['name'] == cfg['active'] else ' '} {x['name']:<8} {x['url']}  {x['model']}"
+             f"{'  (key)' if x.get('apiKey') else ''}  [{probe(x)}]", f"/dictate use {x['name']}") for x in cfg["servers"]]
+    w = max(len(r[0]) for r in rows)
+    return "\n".join(f"{a:<{w}}  |  {b}" for a, b in rows)
+
+
+HELP = """dictation (claude-dictate)
+  /dictate               switch Space-hold dictation on or off (turns built-in /voice off/on)
+  Hold Space             speak while held, release to finish (after /dictate)
+  /dictate rec           hands-free: start recording; run /dictate rec again to finish
+  /dictate where start|caret|end   where the words go in the draft
+  /dictate info          state and servers, with [ready] / [down]
+  /dictate use <name>    choose the server tried first; the others are fallbacks
+  /dictate add <name> <host[:port]|url> [model] [key=<API key>]    /dictate remove <name>
+  A server behind an API key: add key=<token> (saved in ~/.config/claude-dictate/servers.json, mode 600).
+  Audio is recorded locally with parecord and sent only to the configured servers.
+  No sound or only silence: check parecord and the microphone."""
+
+
 def info_cmd() -> int:
     """Where the voice goes, and whether that server is up. Starts nothing."""
-    import urllib.request
-    from urllib.parse import urlparse
-
-    host = urlparse(SWAP).hostname or "?"
-    is_local = host in ("localhost", "127.0.0.1", "::1")
-
-    def get(path: str):
-        with urllib.request.urlopen(f"{SWAP}{path}", timeout=3) as r:
-            return r.read().decode()
-
-    try:
-        get("/health")
-        reach = "reachable"
-        running = json.loads(get("/running")).get("running", [])
-        loaded = next((m["state"] for m in running if m.get("model") == MODEL), None)
-        model_line = f"{MODEL} ({'loaded, ' + loaded if loaded else 'not loaded now, loads on first use'})"
-    except Exception as exc:
-        reach = f"NOT reachable ({type(exc).__name__})"
-        model_line = MODEL
-    print(f"voice server: {SWAP}  [{'this machine' if is_local else 'REMOTE host ' + host}]  {reach}")
-    print(f"model:        {model_line}")
+    print(f"servers (* = active):\n{report()}")
     print(f"language:     {LANG or 'auto-detect'}")
-    print(f"audio:        recorded locally with parecord, sent only to {host}")
     print(f"recording:    {'yes' if PIDF.exists() else 'no'}")
+    return 0
+
+
+def manage(cmd: str, args: list[str]) -> int:
+    cfg = load_cfg()
+    names = [x["name"] for x in cfg["servers"]]
+    name = args[0] if args else ""
+    if os.environ.get("SWAP") and cmd in ("use", "add", "remove"):
+        print("SWAP is set in the environment and overrides the server file; unset it to manage servers.")
+        return 1
+    if cmd == "use":
+        if name not in names:
+            print(f'asr: no server "{name}". Known: {", ".join(names)}')
+            return 1
+        cfg["active"] = name
+        save_cfg(cfg)
+        print(f"asr: using {name}")
+    elif cmd == "add":
+        if len(args) < 2:
+            print("usage: /dictate add <name> <host[:port]|url> [model] [key=<API key>]")
+            return 1
+        rest = args[2:]
+        model = next((t for t in rest if not t.startswith("key=")), DEFAULT_MODEL)
+        key = next((t[4:] for t in rest if t.startswith("key=")), None)
+        url = (args[1] if re.match(r"https?://", args[1]) else f"http://{args[1]}").rstrip("/")
+        old = next((x for x in cfg["servers"] if x["name"] == name), None)
+        key = key or (old or {}).get("apiKey")        # re-adding keeps the saved key
+        entry = {"name": name, "url": url, "model": model, **({"apiKey": key} if key else {})}
+        cfg["servers"] = [entry if x["name"] == name else x for x in cfg["servers"]] if old else cfg["servers"] + [entry]
+        save_cfg(cfg)
+        print(f"asr: {'updated' if old else 'added'} {name} ({url}, {model})\n{report()}")
+    elif cmd == "remove":
+        if len(names) < 2 or name not in names:
+            print(f'asr: cannot remove "{name}" (unknown, or the only server)')
+            return 1
+        cfg["servers"] = [x for x in cfg["servers"] if x["name"] != name]
+        if cfg["active"] == name:
+            cfg["active"] = cfg["servers"][0]["name"]
+        save_cfg(cfg)
+        print(f"asr: removed {name}; active: {cfg['active']}")
+    return 0
+
+
+def warm_cmd() -> int:
+    """Ask the active server to load the ASR model while the person speaks."""
+    import urllib.request
+    cfg = load_cfg()
+    srv = ordered(cfg)[0]
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{srv['url']}/upstream/{srv['model']}/health", headers=auth(srv)), timeout=30).read()
+    except Exception:
+        pass
     return 0
 
 
@@ -179,4 +308,17 @@ def stop_cmd() -> int:
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    sys.exit(asyncio.run(record()) if cmd == "record" else stop_cmd() if cmd == "stop" else info_cmd() if cmd == "info" else 2)
+    if cmd == "record":
+        sys.exit(asyncio.run(record()))
+    if cmd == "stop":
+        sys.exit(stop_cmd())
+    if cmd == "info":
+        sys.exit(info_cmd())
+    if cmd == "help":
+        print(HELP)
+        sys.exit(0)
+    if cmd == "warm":
+        sys.exit(warm_cmd())
+    if cmd in ("use", "add", "remove"):
+        sys.exit(manage(cmd, sys.argv[2:]))
+    sys.exit(2)

@@ -1,7 +1,7 @@
 # dictate
 
-Local, private speech-to-text for Claude Code. Hold Space, speak, and your words
-stream into the prompt box as you talk. Transcription runs on a speech model served
+Local, private speech-to-text for Claude Code. Hold Space, or run `/dictate rec` for
+hands-free recording, speak, and your words stream into the prompt box as you talk. Transcription runs on a speech model served
 by [llama-swap](https://github.com/mostlygeek/llama-swap) on your own machine, so
 audio never goes to a cloud service. It is a "mod" (a Claude Code plugin with a hooks
 module) and does not change Claude Code itself.
@@ -41,9 +41,19 @@ claude --plugin-dir ./dictate_asr
 
 | Command | What it does |
 | --- | --- |
-| `/dictate` | Switch local dictation on or off. On: the built-in `/voice` is turned off so Space is free for this mod. Off: `/voice hold` is turned back on. It never starts a recording by itself. |
-| `/dictate info` (any argument) | Show which server the audio goes to, the model, whether the server is reachable, and whether the mode is on. Changes nothing. |
-| Hold **Space** | While the mode is on: recording starts after the key-repeat warm-up (about half a second), words appear dimmed in the prompt as you speak, and releasing Space finalizes the text at your caret. |
+| `/dictate` | Switch Space-hold dictation on or off. On: the built-in `/voice` is turned off so Space is free for this mod. Off: `/voice hold` is turned back on. It never starts a recording by itself. |
+| `/dictate rec` | Hands-free recording: the first run starts it, **Enter** or a second `/dictate rec` finishes it. Enter does not send the prompt while a recording runs. Works without `/dictate` being on. |
+| `/dictate help` | Show the commands. |
+| `/dictate info` | Show the servers (`*` marks the active one, with `[ready]`, `[down]`, `[needs an API key]`, `[API key rejected]`), the mode and the placement. Changes nothing. |
+| `/dictate use <name>` | Make a server the active one. |
+| `/dictate add <name> <host[:port]\|url> [model] [key=<API key>]` | Add or update a server. Model defaults to `lfm3-audio-2b`. Re-adding without `key=` keeps the saved key. |
+| `/dictate remove <name>` | Remove a server (the last one cannot be removed). |
+| `/dictate where start\|caret\|end` | Where the words go in the draft. Saved across sessions. Default `caret`. |
+| Hold **Space** | While the mode is on: recording starts after the key-repeat warm-up (about half a second), words appear dimmed in the prompt as you speak, and releasing Space finalizes the text. |
+
+A shortcut such as Ctrl+R is not possible: a Claude Code mod only sees keys that edit the
+prompt text, so Ctrl and Alt combinations never reach it. That is why hands-free recording
+is a command.
 
 A red `REC` line shows above the prompt while recording and a yellow one while the
 final transcript is produced. If you edit the prompt while it finishes, your edit is
@@ -55,22 +65,40 @@ the mod says so and leaves `/voice` alone, and Space-hold dictation still works.
 
 ## Configuration
 
-Set these environment variables in the shell that starts `claude`:
+Servers are kept in `~/.config/claude-dictate/servers.json` (mode 600), managed with
+`/dictate add|use|remove`, or edited by hand:
+
+```json
+{
+  "active": "local",
+  "servers": [
+    { "name": "local", "url": "http://localhost:8181", "model": "lfm3-audio-2b", "apiKey": "<token>" },
+    { "name": "desk", "url": "http://desk.local:8181", "model": "lfm3-audio-2b" }
+  ]
+}
+```
+
+- The `active` server is tried first. If it fails (connection error or HTTP error), the others
+  are tried in order; the red REC line then shows `asr: desk (fallback, local failed)`.
+- `apiKey` (optional, per server) is sent as `Authorization: Bearer <apiKey>`. Keys are stored in
+  plain text in that file: do not commit or share it.
+- Without a file there is one server, `local`, at `http://localhost:8181`.
+
+Environment variables, set in the shell that starts `claude`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SWAP` | `http://localhost:8181` | llama-swap base URL |
-| `ASR_MODEL` | `lfm3-audio-2b` | model name sent to the server |
+| `SWAP`, `ASR_MODEL`, `ASR_API_KEY` | unset | If `SWAP` is set, it defines one server (`env`) that replaces the file. |
 | `ASR_LANG` | unset (auto-detect) | pin a language, e.g. `German` |
 | `STEP_SEC` | `1.0` | seconds of new audio between live updates |
 | `MAX_SECS` | `120` | longest recording |
 
 ## Privacy
 
-Audio is recorded locally with `parecord` and sent only to the server in `SWAP`.
-`/dictate info` prints that address and labels it as this machine or a remote host.
-Nothing is written to disk by the helper except a small pid file in
-`$XDG_RUNTIME_DIR/claude-dictate/`.
+Audio is recorded locally with `parecord` and sent only to the servers you configured, in
+the order active first, then the others if it fails. `/dictate info` lists them. Nothing is
+written to disk except a small pid file in `$XDG_RUNTIME_DIR/claude-dictate/` and the
+server file above, which can hold API keys.
 
 ## Limitations
 
