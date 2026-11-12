@@ -1,6 +1,6 @@
 {
   "name": "dictate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local, private speech-to-text for Claude Code: hold Space and your words stream into the prompt, transcribed by an LFM3-Audio model served through llama-swap on your own machine.",
   "license": "MIT",
   "keywords": ["speech-to-text", "dictation", "voice", "local", "llama-swap"],

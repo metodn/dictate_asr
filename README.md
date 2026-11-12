@@ -37,6 +37,23 @@ git clone https://github.com/metodn/dictate_asr
 claude --plugin-dir ./dictate_asr
 ```
 
+## Update
+
+Claude Code caches an installed plugin by its version, so an update is only picked up when
+`version` in `.claude-plugin/plugin.json` has changed. To update:
+
+```
+claude plugin update dictate@dictate
+```
+
+then restart `claude`. Run `/dictate help` to check: the current version lists `rec`, `use`,
+`add`, `remove` and `where`. If nothing changed, remove and reinstall:
+
+```
+claude plugin uninstall dictate@dictate
+claude plugin install dictate --marketplace metodn/dictate_asr
+```
+
 ## Use
 
 | Command | What it does |
